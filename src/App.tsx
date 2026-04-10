@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import "./App.css";
 
-type Status = "idle" | "connecting" | "recording" | "thinking";
+type Status = "idle" | "connecting" | "recording" | "thinking" | "speaking";
 
 interface Message {
 	role: "user" | "assistant";
@@ -16,6 +16,7 @@ function App() {
 	const [conversationMode, setConversationMode] = useState(true);
 	const [messages, setMessages] = useState<Message[]>([]);
 	const [assistantResponse, setAssistantResponse] = useState("");
+	const [ttsEnabled, setTtsEnabled] = useState(true);
 
 	const wsRef = useRef<WebSocket | null>(null);
 	const audioCtxRef = useRef<AudioContext | null>(null);
@@ -23,6 +24,11 @@ function App() {
 	const streamRef = useRef<MediaStream | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
 	const conversationModeRef = useRef(true);
+	const ttsEnabledRef = useRef(true);
+	
+	// TTS audio playback
+	const audioChunksRef = useRef<Uint8Array[]>([]);
+	const isPlayingRef = useRef(false);
 	
 	// Use refs to track current values for callbacks
 	const transcriptRef = useRef("");
@@ -40,6 +46,10 @@ function App() {
 	useEffect(() => {
 		conversationModeRef.current = conversationMode;
 	}, [conversationMode]);
+
+	useEffect(() => {
+		ttsEnabledRef.current = ttsEnabled;
+	}, [ttsEnabled]);
 
 	// Auto-scroll to bottom when messages change
 	useEffect(() => {
@@ -71,6 +81,39 @@ function App() {
 
 	// Cleanup on unmount
 	useEffect(() => cleanup, [cleanup]);
+
+	const playTTSAudio = useCallback(async () => {
+		if (isPlayingRef.current || audioChunksRef.current.length === 0) return;
+		
+		isPlayingRef.current = true;
+		setStatus("speaking");
+		
+		try {
+			// Combine all chunks into a single blob
+			const chunks = audioChunksRef.current;
+			audioChunksRef.current = [];
+			const blob = new Blob(chunks as BlobPart[], { type: "audio/mpeg" });
+			
+			const audioUrl = URL.createObjectURL(blob);
+			const audio = new Audio(audioUrl);
+			
+			await new Promise<void>((resolve, reject) => {
+				audio.onended = () => {
+					URL.revokeObjectURL(audioUrl);
+					resolve();
+				};
+				audio.onerror = () => {
+					URL.revokeObjectURL(audioUrl);
+					reject(new Error("Audio playback failed"));
+				};
+				audio.play().catch(reject);
+			});
+		} catch (err) {
+			console.error("TTS playback error:", err);
+		} finally {
+			isPlayingRef.current = false;
+		}
+	}, []);
 
 	const startAudioCapture = useCallback(async (ws: WebSocket) => {
 		// Get fresh microphone stream
@@ -105,6 +148,7 @@ function App() {
 			setTranscript("");
 			setAssistantResponse("");
 			setLanguage(null);
+			audioChunksRef.current = [];
 
 			const proto = location.protocol === "https:" ? "wss:" : "ws:";
 			const ws = new WebSocket(`${proto}//${location.host}/api/transcribe`);
@@ -112,7 +156,13 @@ function App() {
 
 			ws.binaryType = "arraybuffer";
 
-			ws.onmessage = (event) => {
+			ws.onmessage = async (event) => {
+				// Handle binary TTS audio data
+				if (event.data instanceof ArrayBuffer) {
+					audioChunksRef.current.push(new Uint8Array(event.data));
+					return;
+				}
+
 				try {
 					const data = JSON.parse(event.data as string);
 					switch (data.type) {
@@ -142,9 +192,21 @@ function App() {
 							}
 							setTranscript("");
 							setAssistantResponse("");
+							audioChunksRef.current = [];
 							break;
 						case "assistant_delta":
 							setAssistantResponse((prev) => prev + data.text);
+							break;
+						case "tts_start":
+							// TTS audio streaming started
+							audioChunksRef.current = [];
+							break;
+						case "tts_done":
+							// Play the accumulated audio
+							await playTTSAudio();
+							break;
+						case "tts_error":
+							console.error("TTS error:", data.message);
 							break;
 						case "assistant_done":
 							// Move streaming response to messages using ref
@@ -153,13 +215,20 @@ function App() {
 								setMessages((prev) => [...prev, { role: "assistant", content: response }]);
 							}
 							setAssistantResponse("");
-							// Auto-restart recording for continuous conversation
-							if (conversationModeRef.current && ws.readyState === WebSocket.OPEN) {
-								ws.send(JSON.stringify({ type: "start", conversationMode: true }));
-								// Will receive "ready" event which triggers startAudioCapture
-							} else {
-								setStatus("idle");
-							}
+							
+							// Wait for TTS to finish if it's playing
+							const waitForTTS = async () => {
+								while (isPlayingRef.current) {
+									await new Promise(r => setTimeout(r, 100));
+								}
+								// Auto-restart recording for continuous conversation
+								if (conversationModeRef.current && ws.readyState === WebSocket.OPEN) {
+									ws.send(JSON.stringify({ type: "start", conversationMode: true, ttsEnabled: ttsEnabledRef.current }));
+								} else {
+									setStatus("idle");
+								}
+							};
+							waitForTTS();
 							break;
 						case "history_cleared":
 							setMessages([]);
@@ -189,13 +258,13 @@ function App() {
 				ws.addEventListener("error", () => reject(new Error("Connection failed")), { once: true });
 			});
 
-			ws.send(JSON.stringify({ type: "start", conversationMode }));
+			ws.send(JSON.stringify({ type: "start", conversationMode, ttsEnabled }));
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "Failed to start recording");
 			setStatus("idle");
 			cleanup();
 		}
-	}, [cleanup, cleanupAudio, startAudioCapture, conversationMode]);
+	}, [cleanup, cleanupAudio, startAudioCapture, conversationMode, ttsEnabled, playTTSAudio]);
 
 	const sendMessage = useCallback(() => {
 		// Send current transcript to get assistant response
@@ -220,7 +289,15 @@ function App() {
 		setAssistantResponse("");
 	}, []);
 
-	const isActive = status === "recording" || status === "thinking" || status === "connecting";
+	const toggleTTS = useCallback(() => {
+		const newValue = !ttsEnabled;
+		setTtsEnabled(newValue);
+		if (wsRef.current?.readyState === WebSocket.OPEN) {
+			wsRef.current.send(JSON.stringify({ type: "set_tts", enabled: newValue }));
+		}
+	}, [ttsEnabled]);
+
+	const isActive = status === "recording" || status === "thinking" || status === "connecting" || status === "speaking";
 
 	return (
 		<div className="app">
@@ -249,6 +326,22 @@ function App() {
 				</button>
 			</div>
 
+			{/* TTS toggle (only in conversation mode) */}
+			{conversationMode && (
+				<label className="tts-toggle">
+					<input
+						type="checkbox"
+						checked={ttsEnabled}
+						onChange={toggleTTS}
+						disabled={isActive}
+					/>
+					<span className="tts-label">
+						<SpeakerIcon />
+						Voice responses
+					</span>
+				</label>
+			)}
+
 			{/* Main content area */}
 			{conversationMode ? (
 				<div className="chat-container">
@@ -258,7 +351,7 @@ function App() {
 					<div className="corner br" />
 
 					<div className="chat-messages">
-						{messages.length === 0 && !transcript && !assistantResponse && status !== "thinking" && (
+						{messages.length === 0 && !transcript && !assistantResponse && status !== "thinking" && status !== "speaking" && (
 							<div className="chat-placeholder">
 								{status === "recording" 
 									? "Listening — start speaking…" 
@@ -285,12 +378,12 @@ function App() {
 						)}
 
 						{/* Assistant streaming response */}
-						{(status === "thinking" || assistantResponse) && (
+						{(status === "thinking" || status === "speaking" || assistantResponse) && (
 							<div className="chat-message assistant streaming">
 								<div className="message-role">Assistant</div>
 								<div className="message-content">
 									{assistantResponse || <span className="thinking-dots">Thinking</span>}
-									{status === "thinking" && assistantResponse && <span className="cursor" />}
+									{(status === "thinking" || status === "speaking") && assistantResponse && <span className="cursor" />}
 								</div>
 							</div>
 						)}
@@ -344,6 +437,11 @@ function App() {
 						<span className="spinner" />
 						Thinking…
 					</button>
+				) : status === "speaking" ? (
+					<button className="btn-disabled" disabled>
+						<SpeakerIcon />
+						Speaking…
+					</button>
 				) : conversationMode ? (
 					<div className="btn-group">
 						<button className="btn-send" onClick={sendMessage} disabled={!transcript.trim()}>
@@ -388,6 +486,7 @@ function App() {
 			<footer className="footer">
 				<code>voxtral-mini-transcribe-realtime-2602</code>
 				{conversationMode && <> + <code>mistral-medium-latest</code></>}
+				{conversationMode && ttsEnabled && <> + <code>ElevenLabs TTS</code></>}
 			</footer>
 		</div>
 	);
@@ -400,6 +499,16 @@ function MicIcon() {
 			<path d="M4 9a6 6 0 0 0 12 0" />
 			<line x1="10" y1="15" x2="10" y2="19" />
 			<line x1="7" y1="19" x2="13" y2="19" />
+		</svg>
+	);
+}
+
+function SpeakerIcon() {
+	return (
+		<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+			<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+			<path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+			<path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
 		</svg>
 	);
 }

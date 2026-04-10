@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 export interface Env {
 	TRANSCRIPTION_ROOM: DurableObjectNamespace<TranscriptionRoom>;
 	MISTRAL_API_KEY: string;
+	ELEVENLABS_API_KEY: string;
 	ASSETS: Fetcher;
 }
 
@@ -11,9 +12,11 @@ interface ConversationMessage {
 	content: string;
 }
 
+const ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"; // "George" - change as needed
+
 /**
  * Durable Object that bridges a browser WebSocket to Mistral's realtime
- * transcription WebSocket API, with optional conversation mode.
+ * transcription WebSocket API, with conversation mode and TTS.
  */
 export class TranscriptionRoom extends DurableObject<Env> {
 	private mistralWs: WebSocket | null = null;
@@ -25,6 +28,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 	private lastTextTime = 0;
 	private silenceCheckInterval: ReturnType<typeof setInterval> | null = null;
 	private isProcessingResponse = false;
+	private ttsEnabled = true;
 
 	async fetch(request: Request): Promise<Response> {
 		if (request.headers.get("Upgrade") !== "websocket") {
@@ -47,6 +51,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 				const data = JSON.parse(message);
 				if (data.type === "start") {
 					this.conversationMode = data.conversationMode ?? false;
+					this.ttsEnabled = data.ttsEnabled ?? true;
 					this.currentTranscript = "";
 					this.isProcessingResponse = false;
 					if (data.systemInstructions) {
@@ -58,6 +63,8 @@ export class TranscriptionRoom extends DurableObject<Env> {
 				} else if (data.type === "clear_history") {
 					this.conversationHistory = [];
 					this.sendToBrowser(JSON.stringify({ type: "history_cleared" }));
+				} else if (data.type === "set_tts") {
+					this.ttsEnabled = data.enabled ?? true;
 				}
 			} catch (err) {
 				ws.send(
@@ -382,6 +389,11 @@ export class TranscriptionRoom extends DurableObject<Env> {
 				this.conversationHistory.push({ role: "assistant", content: assistantMessage });
 			}
 
+			// Generate TTS audio if enabled
+			if (this.ttsEnabled && assistantMessage && this.env.ELEVENLABS_API_KEY) {
+				await this.generateAndSendTTS(assistantMessage);
+			}
+
 			this.sendToBrowser(JSON.stringify({ type: "assistant_done" }));
 		} catch (err) {
 			this.sendToBrowser(
@@ -395,10 +407,78 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		}
 	}
 
+	private async generateAndSendTTS(text: string): Promise<void> {
+		try {
+			this.sendToBrowser(JSON.stringify({ type: "tts_start" }));
+
+			const response = await fetch(
+				`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						"xi-api-key": this.env.ELEVENLABS_API_KEY,
+					},
+					body: JSON.stringify({
+						text,
+						model_id: "eleven_multilingual_v2",
+						output_format: "mp3_44100_128",
+						voice_settings: {
+							stability: 0.5,
+							similarity_boost: 0.75,
+						},
+					}),
+				},
+			);
+
+			if (!response.ok) {
+				const errorText = await response.text().catch(() => "Unknown error");
+				console.error(`ElevenLabs TTS error (${response.status}): ${errorText}`);
+				this.sendToBrowser(JSON.stringify({ type: "tts_error", message: "TTS generation failed" }));
+				return;
+			}
+
+			// Stream audio chunks to browser
+			const reader = response.body?.getReader();
+			if (!reader) {
+				this.sendToBrowser(JSON.stringify({ type: "tts_error", message: "No audio stream" }));
+				return;
+			}
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				// Send audio chunk as binary
+				this.sendBinaryToBrowser(value);
+			}
+
+			this.sendToBrowser(JSON.stringify({ type: "tts_done" }));
+		} catch (err) {
+			console.error("TTS error:", err);
+			this.sendToBrowser(
+				JSON.stringify({
+					type: "tts_error",
+					message: err instanceof Error ? err.message : "TTS failed",
+				}),
+			);
+		}
+	}
+
 	private sendToBrowser(message: string): void {
 		for (const ws of this.ctx.getWebSockets()) {
 			try {
 				ws.send(message);
+			} catch {
+				// Browser socket may already be closed
+			}
+		}
+	}
+
+	private sendBinaryToBrowser(data: Uint8Array): void {
+		for (const ws of this.ctx.getWebSockets()) {
+			try {
+				ws.send(data);
 			} catch {
 				// Browser socket may already be closed
 			}
