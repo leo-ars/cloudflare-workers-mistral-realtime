@@ -108,16 +108,16 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		this.stopSilenceCheck();
 		this.lastTextTime = Date.now();
 		
-		// Check every 500ms if we've had 1.5s of silence after receiving text
+		// Check every 500ms if we've had 2s of silence after receiving text
 		this.silenceCheckInterval = setInterval(() => {
 			const now = Date.now();
 			const silenceDuration = now - this.lastTextTime;
 			
-			// If we have transcript and 1.5s of silence, trigger response
+			// If we have transcript and 2s of silence, trigger response
 			if (
 				this.conversationMode &&
 				this.currentTranscript.trim() &&
-				silenceDuration > 1500 &&
+				silenceDuration > 2000 &&
 				!this.isProcessingResponse
 			) {
 				this.triggerConversationResponse();
@@ -146,10 +146,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		// Trigger LLM response
 		await this.handleConversation(transcript);
 		
-		// Reconnect for next turn
-		if (this.conversationMode) {
-			await this.connectToMistral();
-		}
+		// Don't auto-reconnect - let user click button again
 	}
 
 	private async connectToMistral(): Promise<void> {

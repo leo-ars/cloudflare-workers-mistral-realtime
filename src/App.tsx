@@ -148,6 +148,11 @@ function App() {
 							});
 							setAssistantResponse("");
 							setStatus("idle");
+							// Close WebSocket - user needs to click button for next turn
+							if (wsRef.current) {
+								wsRef.current.close();
+								wsRef.current = null;
+							}
 							break;
 						case "history_cleared":
 							setMessages([]);
