@@ -14,12 +14,6 @@ interface ConversationMessage {
 /**
  * Durable Object that bridges a browser WebSocket to Mistral's realtime
  * transcription WebSocket API, with optional conversation mode.
- *
- * Browser  ──ws──▸  TranscriptionRoom  ──ws──▸  Mistral Transcription API
- *   (PCM binary)       (base64 JSON)
- *                           │
- *                           ▼
- *                   Mistral Conversations API (when conversationMode=true)
  */
 export class TranscriptionRoom extends DurableObject<Env> {
 	private mistralWs: WebSocket | null = null;
@@ -28,6 +22,9 @@ export class TranscriptionRoom extends DurableObject<Env> {
 	private conversationHistory: ConversationMessage[] = [];
 	private currentTranscript = "";
 	private systemInstructions = "You are a helpful voice assistant. Keep responses concise and conversational.";
+	private lastTextTime = 0;
+	private silenceCheckInterval: ReturnType<typeof setInterval> | null = null;
+	private isProcessingResponse = false;
 
 	async fetch(request: Request): Promise<Response> {
 		if (request.headers.get("Upgrade") !== "websocket") {
@@ -41,8 +38,6 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
-	// --- Hibernatable WebSocket handlers ---
-
 	async webSocketMessage(
 		ws: WebSocket,
 		message: string | ArrayBuffer,
@@ -53,12 +48,13 @@ export class TranscriptionRoom extends DurableObject<Env> {
 				if (data.type === "start") {
 					this.conversationMode = data.conversationMode ?? false;
 					this.currentTranscript = "";
+					this.isProcessingResponse = false;
 					if (data.systemInstructions) {
 						this.systemInstructions = data.systemInstructions;
 					}
 					await this.connectToMistral();
 				} else if (data.type === "stop") {
-					await this.stopTranscription();
+					await this.handleStop();
 				} else if (data.type === "clear_history") {
 					this.conversationHistory = [];
 					this.sendToBrowser(JSON.stringify({ type: "history_cleared" }));
@@ -90,10 +86,71 @@ export class TranscriptionRoom extends DurableObject<Env> {
 	}
 
 	async webSocketClose(): Promise<void> {
-		await this.stopTranscription();
+		this.stopSilenceCheck();
+		await this.closeMistralConnection();
 	}
 
-	// --- Mistral connection management ---
+	private async handleStop(): Promise<void> {
+		this.stopSilenceCheck();
+		
+		// Close Mistral transcription connection
+		await this.closeMistralConnection();
+		
+		// If we have transcript and conversation mode, trigger LLM response
+		if (this.conversationMode && this.currentTranscript.trim() && !this.isProcessingResponse) {
+			await this.handleConversation(this.currentTranscript.trim());
+		}
+		
+		this.currentTranscript = "";
+	}
+
+	private startSilenceCheck(): void {
+		this.stopSilenceCheck();
+		this.lastTextTime = Date.now();
+		
+		// Check every 500ms if we've had 1.5s of silence after receiving text
+		this.silenceCheckInterval = setInterval(() => {
+			const now = Date.now();
+			const silenceDuration = now - this.lastTextTime;
+			
+			// If we have transcript and 1.5s of silence, trigger response
+			if (
+				this.conversationMode &&
+				this.currentTranscript.trim() &&
+				silenceDuration > 1500 &&
+				!this.isProcessingResponse
+			) {
+				this.triggerConversationResponse();
+			}
+		}, 500);
+	}
+
+	private stopSilenceCheck(): void {
+		if (this.silenceCheckInterval) {
+			clearInterval(this.silenceCheckInterval);
+			this.silenceCheckInterval = null;
+		}
+	}
+
+	private async triggerConversationResponse(): Promise<void> {
+		if (this.isProcessingResponse || !this.currentTranscript.trim()) return;
+		
+		this.stopSilenceCheck();
+		
+		const transcript = this.currentTranscript.trim();
+		this.currentTranscript = "";
+		
+		// Close transcription to stop audio streaming
+		await this.closeMistralConnection();
+		
+		// Trigger LLM response
+		await this.handleConversation(transcript);
+		
+		// Reconnect for next turn
+		if (this.conversationMode) {
+			await this.connectToMistral();
+		}
+	}
 
 	private async connectToMistral(): Promise<void> {
 		const apiKey = this.env.MISTRAL_API_KEY;
@@ -101,8 +158,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 			this.sendToBrowser(
 				JSON.stringify({
 					type: "error",
-					message:
-						"MISTRAL_API_KEY is not configured. Run: npx wrangler secret put MISTRAL_API_KEY",
+					message: "MISTRAL_API_KEY is not configured.",
 				}),
 			);
 			return;
@@ -167,7 +223,6 @@ export class TranscriptionRoom extends DurableObject<Env> {
 
 			switch (data.type) {
 				case "session.created":
-					// Configure the audio format, then signal browser to start streaming
 					if (this.mistralWs) {
 						this.mistralWs.send(
 							JSON.stringify({
@@ -183,14 +238,19 @@ export class TranscriptionRoom extends DurableObject<Env> {
 					}
 					this.isReady = true;
 					this.sendToBrowser(JSON.stringify({ type: "ready" }));
+					
+					// Start silence detection in conversation mode
+					if (this.conversationMode) {
+						this.startSilenceCheck();
+					}
 					break;
 
 				case "session.updated":
-					// Audio format confirmed – nothing extra to do
 					break;
 
 				case "transcription.text.delta":
 					this.currentTranscript += data.text;
+					this.lastTextTime = Date.now(); // Reset silence timer
 					this.sendToBrowser(
 						JSON.stringify({ type: "text_delta", text: data.text }),
 					);
@@ -203,15 +263,10 @@ export class TranscriptionRoom extends DurableObject<Env> {
 					break;
 
 				case "transcription.segment":
-					// Segment-level delta – forward as-is for debugging
 					break;
 
 				case "transcription.done":
 					this.sendToBrowser(JSON.stringify({ type: "transcription_done" }));
-					// If conversation mode, send transcript to LLM
-					if (this.conversationMode && this.currentTranscript.trim()) {
-						this.handleConversation(this.currentTranscript.trim());
-					}
 					break;
 
 				case "error":
@@ -236,6 +291,8 @@ export class TranscriptionRoom extends DurableObject<Env> {
 	}
 
 	private async handleConversation(userMessage: string): Promise<void> {
+		this.isProcessingResponse = true;
+		
 		// Add user message to history
 		this.conversationHistory.push({ role: "user", content: userMessage });
 
@@ -266,7 +323,6 @@ export class TranscriptionRoom extends DurableObject<Env> {
 				throw new Error(`Mistral API error (${response.status}): ${errorText}`);
 			}
 
-			// Stream the response
 			const reader = response.body?.getReader();
 			if (!reader) throw new Error("No response body");
 
@@ -314,6 +370,8 @@ export class TranscriptionRoom extends DurableObject<Env> {
 					message: `Conversation error: ${err instanceof Error ? err.message : String(err)}`,
 				}),
 			);
+		} finally {
+			this.isProcessingResponse = false;
 		}
 	}
 
@@ -327,7 +385,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		}
 	}
 
-	private async stopTranscription(): Promise<void> {
+	private async closeMistralConnection(): Promise<void> {
 		if (this.mistralWs) {
 			try {
 				this.mistralWs.send(JSON.stringify({ type: "input_audio.flush" }));
@@ -350,15 +408,13 @@ export class TranscriptionRoom extends DurableObject<Env> {
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
 	const bytes = new Uint8Array(buffer);
 	const chunks: string[] = [];
-	const chunkSize = 0x8000; // 32 KiB
+	const chunkSize = 0x8000;
 	for (let i = 0; i < bytes.length; i += chunkSize) {
 		const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
 		chunks.push(String.fromCharCode(...slice));
 	}
 	return btoa(chunks.join(""));
 }
-
-// --- Worker entry point ---
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
@@ -368,13 +424,11 @@ export default {
 			if (request.headers.get("Upgrade") !== "websocket") {
 				return new Response("Expected WebSocket upgrade", { status: 426 });
 			}
-			// Each session gets its own DO instance
 			const id = env.TRANSCRIPTION_ROOM.newUniqueId();
 			const stub = env.TRANSCRIPTION_ROOM.get(id);
 			return stub.fetch(request);
 		}
 
-		// Let the static assets middleware handle everything else
 		return env.ASSETS.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;

@@ -22,13 +22,26 @@ function App() {
 	const workletRef = useRef<AudioWorkletNode | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
+	
+	// Use refs to track current values for callbacks
+	const transcriptRef = useRef("");
+	const assistantResponseRef = useRef("");
+
+	// Keep refs in sync with state
+	useEffect(() => {
+		transcriptRef.current = transcript;
+	}, [transcript]);
+	
+	useEffect(() => {
+		assistantResponseRef.current = assistantResponse;
+	}, [assistantResponse]);
 
 	// Auto-scroll to bottom when messages change
 	useEffect(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
 	}, [messages, assistantResponse]);
 
-	const cleanup = useCallback(() => {
+	const cleanupAudio = useCallback(() => {
 		if (workletRef.current) {
 			workletRef.current.disconnect();
 			workletRef.current = null;
@@ -41,11 +54,15 @@ function App() {
 			streamRef.current.getTracks().forEach((t) => t.stop());
 			streamRef.current = null;
 		}
+	}, []);
+
+	const cleanup = useCallback(() => {
+		cleanupAudio();
 		if (wsRef.current) {
 			wsRef.current.close();
 			wsRef.current = null;
 		}
-	}, []);
+	}, [cleanupAudio]);
 
 	// Cleanup on unmount
 	useEffect(() => cleanup, [cleanup]);
@@ -107,12 +124,13 @@ function App() {
 							setLanguage(data.language);
 							break;
 						case "transcription_done":
-							// In conversation mode, user message will be added when assistant starts
 							break;
 						case "assistant_thinking":
 							setStatus("thinking");
-							// Add user message to chat
-							setMessages((prev) => [...prev, { role: "user", content: transcript }]);
+							// Stop audio capture while assistant is thinking
+							cleanupAudio();
+							// Add user message using ref for current value
+							setMessages((prev) => [...prev, { role: "user", content: transcriptRef.current }]);
 							setTranscript("");
 							setAssistantResponse("");
 							break;
@@ -120,11 +138,11 @@ function App() {
 							setAssistantResponse((prev) => prev + data.text);
 							break;
 						case "assistant_done":
-							// Move streaming response to messages
+							// Move streaming response to messages using ref
 							setMessages((prev) => {
-								const lastAssistant = assistantResponse;
-								if (lastAssistant) {
-									return [...prev, { role: "assistant", content: lastAssistant }];
+								const response = assistantResponseRef.current;
+								if (response) {
+									return [...prev, { role: "assistant", content: response }];
 								}
 								return prev;
 							});
@@ -151,7 +169,8 @@ function App() {
 			};
 
 			ws.onclose = () => {
-				if (status === "recording") setStatus("idle");
+				// Don't reset status if we're thinking
+				setStatus((current) => current === "thinking" ? current : "idle");
 			};
 
 			await new Promise<void>((resolve, reject) => {
@@ -165,16 +184,23 @@ function App() {
 			setStatus("idle");
 			cleanup();
 		}
-	}, [cleanup, startAudioCapture, status, conversationMode, transcript, assistantResponse]);
+	}, [cleanup, cleanupAudio, startAudioCapture, conversationMode]);
 
 	const stopRecording = useCallback(() => {
-		setStatus("stopping");
+		// In conversation mode, send stop and wait for response
 		if (wsRef.current?.readyState === WebSocket.OPEN) {
 			wsRef.current.send(JSON.stringify({ type: "stop" }));
 		}
-		cleanup();
-		setStatus("idle");
-	}, [cleanup]);
+		// Stop audio but keep WS open for response
+		cleanupAudio();
+		
+		// If not in conversation mode or no transcript, go to idle
+		if (!conversationMode || !transcriptRef.current.trim()) {
+			cleanup();
+			setStatus("idle");
+		}
+		// Otherwise, status will be set to "thinking" by assistant_thinking event
+	}, [cleanup, cleanupAudio, conversationMode]);
 
 	const clearHistory = useCallback(() => {
 		if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -221,7 +247,7 @@ function App() {
 					<div className="corner br" />
 
 					<div className="chat-messages">
-						{messages.length === 0 && !transcript && !assistantResponse && (
+						{messages.length === 0 && !transcript && !assistantResponse && status !== "thinking" && (
 							<div className="chat-placeholder">
 								Press the button and speak to start a conversation
 							</div>
@@ -293,22 +319,22 @@ function App() {
 				{status === "idle" ? (
 					<button className="btn-primary" onClick={startRecording}>
 						<MicIcon />
-						{conversationMode ? "Hold to Speak" : "Start Recording"}
+						{conversationMode ? "Press to Speak" : "Start Recording"}
 					</button>
 				) : status === "connecting" ? (
 					<button className="btn-disabled" disabled>
 						<span className="spinner" />
 						Connecting…
 					</button>
-				) : status === "thinking" ? (
+				) : status === "thinking" || status === "stopping" ? (
 					<button className="btn-disabled" disabled>
 						<span className="spinner" />
-						Thinking…
+						{status === "thinking" ? "Thinking…" : "Processing…"}
 					</button>
 				) : (
 					<button className="btn-stop" onClick={stopRecording}>
 						<span className="stop-icon">■</span>
-						Stop
+						{conversationMode ? "Send" : "Stop"}
 					</button>
 				)}
 			</div>
