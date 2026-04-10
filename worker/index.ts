@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 export interface Env {
 	TRANSCRIPTION_ROOM: DurableObjectNamespace<TranscriptionRoom>;
 	MISTRAL_API_KEY: string;
-	ELEVENLABS_API_KEY: string;
+	ELEVENLABS_API_KEY: SecretsStoreSecret; // From Secrets Store
 	ASSETS: Fetcher;
 }
 
@@ -411,13 +411,21 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		try {
 			this.sendToBrowser(JSON.stringify({ type: "tts_start" }));
 
+			// Get API key from Secrets Store
+			const apiKey = await this.env.ELEVENLABS_API_KEY.get();
+			if (!apiKey) {
+				console.error("ElevenLabs API key not found in Secrets Store");
+				this.sendToBrowser(JSON.stringify({ type: "tts_error", message: "TTS API key not configured" }));
+				return;
+			}
+
 			const response = await fetch(
 				`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
 				{
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
-						"xi-api-key": this.env.ELEVENLABS_API_KEY,
+						"xi-api-key": apiKey,
 					},
 					body: JSON.stringify({
 						text,

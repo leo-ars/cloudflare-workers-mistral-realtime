@@ -26,5 +26,12 @@
 			"tag": "v1",
 			"new_classes": ["TranscriptionRoom"]
 		}
+	],
+	"secrets_store_secrets": [
+		{
+			"binding": "ELEVENLABS_API_KEY",
+			"store_id": "db85e40cd4e54a8dbc96ea27fe9e2a50",
+			"secret_name": "eleven-labs-leo-dev"
+		}
 	]
 }
