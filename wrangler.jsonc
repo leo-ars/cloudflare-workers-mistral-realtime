@@ -1,43 +1,30 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "mistral-test",
+	"name": "mistral-realtime-transcription",
 	"main": "worker/index.ts",
 	"compatibility_date": "2026-04-09",
+	"compatibility_flags": ["nodejs_compat"],
 	"assets": {
-		"not_found_handling": "single-page-application"
+		"not_found_handling": "single-page-application",
+		"binding": "ASSETS"
 	},
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"head_sampling_rate": 1
 	},
 	"upload_source_maps": true,
-	"compatibility_flags": [
-		"nodejs_compat"
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "TRANSCRIPTION_ROOM",
+				"class_name": "TranscriptionRoom"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": ["TranscriptionRoom"]
+		}
 	]
-	/**
-	 * Smart Placement
-	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	// "placement": {  "mode": "smart" }
-	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
-	 */
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 }
