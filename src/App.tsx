@@ -1,18 +1,32 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import "./App.css";
 
-type Status = "idle" | "connecting" | "recording" | "stopping";
+type Status = "idle" | "connecting" | "recording" | "stopping" | "thinking";
+
+interface Message {
+	role: "user" | "assistant";
+	content: string;
+}
 
 function App() {
 	const [status, setStatus] = useState<Status>("idle");
 	const [transcript, setTranscript] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const [language, setLanguage] = useState<string | null>(null);
+	const [conversationMode, setConversationMode] = useState(true);
+	const [messages, setMessages] = useState<Message[]>([]);
+	const [assistantResponse, setAssistantResponse] = useState("");
 
 	const wsRef = useRef<WebSocket | null>(null);
 	const audioCtxRef = useRef<AudioContext | null>(null);
 	const workletRef = useRef<AudioWorkletNode | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
+	const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+	// Auto-scroll to bottom when messages change
+	useEffect(() => {
+		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+	}, [messages, assistantResponse]);
 
 	const cleanup = useCallback(() => {
 		if (workletRef.current) {
@@ -53,7 +67,6 @@ function App() {
 		};
 
 		source.connect(worklet);
-		// Don't connect to destination – we don't want to play back the mic
 		setStatus("recording");
 	}, []);
 
@@ -62,15 +75,14 @@ function App() {
 			setStatus("connecting");
 			setError(null);
 			setTranscript("");
+			setAssistantResponse("");
 			setLanguage(null);
 
-			// 1. Get microphone permission first (so the user sees the prompt immediately)
 			const stream = await navigator.mediaDevices.getUserMedia({
 				audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
 			});
 			streamRef.current = stream;
 
-			// 2. Connect WebSocket to our Worker
 			const proto = location.protocol === "https:" ? "wss:" : "ws:";
 			const ws = new WebSocket(`${proto}//${location.host}/api/transcribe`);
 			wsRef.current = ws;
@@ -83,9 +95,7 @@ function App() {
 					switch (data.type) {
 						case "ready":
 							startAudioCapture(ws).catch((err) => {
-								setError(
-									err instanceof Error ? err.message : "Audio capture failed",
-								);
+								setError(err instanceof Error ? err.message : "Audio capture failed");
 								setStatus("idle");
 								cleanup();
 							});
@@ -97,9 +107,36 @@ function App() {
 							setLanguage(data.language);
 							break;
 						case "transcription_done":
+							// In conversation mode, user message will be added when assistant starts
+							break;
+						case "assistant_thinking":
+							setStatus("thinking");
+							// Add user message to chat
+							setMessages((prev) => [...prev, { role: "user", content: transcript }]);
+							setTranscript("");
+							setAssistantResponse("");
+							break;
+						case "assistant_delta":
+							setAssistantResponse((prev) => prev + data.text);
+							break;
+						case "assistant_done":
+							// Move streaming response to messages
+							setMessages((prev) => {
+								const lastAssistant = assistantResponse;
+								if (lastAssistant) {
+									return [...prev, { role: "assistant", content: lastAssistant }];
+								}
+								return prev;
+							});
+							setAssistantResponse("");
+							setStatus("idle");
+							break;
+						case "history_cleared":
+							setMessages([]);
 							break;
 						case "error":
 							setError(data.message);
+							setStatus("idle");
 							break;
 					}
 				} catch {
@@ -117,22 +154,18 @@ function App() {
 				if (status === "recording") setStatus("idle");
 			};
 
-			// Wait for open
 			await new Promise<void>((resolve, reject) => {
 				ws.addEventListener("open", () => resolve(), { once: true });
-				ws.addEventListener("error", () => reject(new Error("Connection failed")), {
-					once: true,
-				});
+				ws.addEventListener("error", () => reject(new Error("Connection failed")), { once: true });
 			});
 
-			// 3. Tell the server to connect to Mistral
-			ws.send(JSON.stringify({ type: "start" }));
+			ws.send(JSON.stringify({ type: "start", conversationMode }));
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "Failed to start recording");
 			setStatus("idle");
 			cleanup();
 		}
-	}, [cleanup, startAudioCapture, status]);
+	}, [cleanup, startAudioCapture, status, conversationMode, transcript, assistantResponse]);
 
 	const stopRecording = useCallback(() => {
 		setStatus("stopping");
@@ -143,39 +176,110 @@ function App() {
 		setStatus("idle");
 	}, [cleanup]);
 
+	const clearHistory = useCallback(() => {
+		if (wsRef.current?.readyState === WebSocket.OPEN) {
+			wsRef.current.send(JSON.stringify({ type: "clear_history" }));
+		}
+		setMessages([]);
+		setTranscript("");
+		setAssistantResponse("");
+	}, []);
+
 	return (
 		<div className="app">
 			<header className="header">
-				<h1>Live Transcription</h1>
+				<h1>{conversationMode ? "Voice Assistant" : "Live Transcription"}</h1>
 				<p className="subtitle">
 					Powered by Mistral Voxtral &amp; Cloudflare Workers
 				</p>
 			</header>
 
-			{/* Transcript card */}
-			<div className="transcript-card">
-				<div className="corner tl" />
-				<div className="corner tr" />
-				<div className="corner bl" />
-				<div className="corner br" />
-
-				{language && (
-					<div className="language-badge">
-						{language}
-					</div>
-				)}
-
-				<div className="transcript-content">
-					{transcript || (
-						<span className="placeholder">
-							{status === "recording"
-								? "Listening — start speaking…"
-								: "Press the button below to begin real-time transcription"}
-						</span>
-					)}
-					{status === "recording" && <span className="cursor" />}
-				</div>
+			{/* Mode toggle */}
+			<div className="mode-toggle">
+				<button
+					className={`mode-btn ${!conversationMode ? "active" : ""}`}
+					onClick={() => setConversationMode(false)}
+					disabled={status !== "idle"}
+				>
+					Transcription
+				</button>
+				<button
+					className={`mode-btn ${conversationMode ? "active" : ""}`}
+					onClick={() => setConversationMode(true)}
+					disabled={status !== "idle"}
+				>
+					Conversation
+				</button>
 			</div>
+
+			{/* Main content area */}
+			{conversationMode ? (
+				<div className="chat-container">
+					<div className="corner tl" />
+					<div className="corner tr" />
+					<div className="corner bl" />
+					<div className="corner br" />
+
+					<div className="chat-messages">
+						{messages.length === 0 && !transcript && !assistantResponse && (
+							<div className="chat-placeholder">
+								Press the button and speak to start a conversation
+							</div>
+						)}
+
+						{messages.map((msg, i) => (
+							<div key={i} className={`chat-message ${msg.role}`}>
+								<div className="message-role">{msg.role === "user" ? "You" : "Assistant"}</div>
+								<div className="message-content">{msg.content}</div>
+							</div>
+						))}
+
+						{/* Current user transcript (while recording) */}
+						{transcript && (
+							<div className="chat-message user streaming">
+								<div className="message-role">You</div>
+								<div className="message-content">
+									{transcript}
+									{status === "recording" && <span className="cursor" />}
+								</div>
+							</div>
+						)}
+
+						{/* Assistant streaming response */}
+						{(status === "thinking" || assistantResponse) && (
+							<div className="chat-message assistant streaming">
+								<div className="message-role">Assistant</div>
+								<div className="message-content">
+									{assistantResponse || <span className="thinking-dots">Thinking</span>}
+									{status === "thinking" && assistantResponse && <span className="cursor" />}
+								</div>
+							</div>
+						)}
+
+						<div ref={messagesEndRef} />
+					</div>
+				</div>
+			) : (
+				<div className="transcript-card">
+					<div className="corner tl" />
+					<div className="corner tr" />
+					<div className="corner bl" />
+					<div className="corner br" />
+
+					{language && <div className="language-badge">{language}</div>}
+
+					<div className="transcript-content">
+						{transcript || (
+							<span className="placeholder">
+								{status === "recording"
+									? "Listening — start speaking…"
+									: "Press the button below to begin real-time transcription"}
+							</span>
+						)}
+						{status === "recording" && <span className="cursor" />}
+					</div>
+				</div>
+			)}
 
 			{/* Error banner */}
 			{error && (
@@ -189,33 +293,46 @@ function App() {
 				{status === "idle" ? (
 					<button className="btn-primary" onClick={startRecording}>
 						<MicIcon />
-						Start Recording
+						{conversationMode ? "Hold to Speak" : "Start Recording"}
 					</button>
 				) : status === "connecting" ? (
 					<button className="btn-disabled" disabled>
 						<span className="spinner" />
 						Connecting…
 					</button>
+				) : status === "thinking" ? (
+					<button className="btn-disabled" disabled>
+						<span className="spinner" />
+						Thinking…
+					</button>
 				) : (
 					<button className="btn-stop" onClick={stopRecording}>
 						<span className="stop-icon">■</span>
-						Stop Recording
+						Stop
 					</button>
 				)}
 			</div>
 
-			{/* Copy button */}
-			{transcript && status === "idle" && (
-				<button
-					className="btn-ghost"
-					onClick={() => navigator.clipboard.writeText(transcript)}
-				>
-					Copy transcript
-				</button>
-			)}
+			{/* Secondary actions */}
+			<div className="secondary-actions">
+				{transcript && status === "idle" && !conversationMode && (
+					<button
+						className="btn-ghost"
+						onClick={() => navigator.clipboard.writeText(transcript)}
+					>
+						Copy transcript
+					</button>
+				)}
+				{conversationMode && messages.length > 0 && status === "idle" && (
+					<button className="btn-ghost" onClick={clearHistory}>
+						Clear conversation
+					</button>
+				)}
+			</div>
 
 			<footer className="footer">
-				<code>voxtral-mini-transcribe-realtime-2602</code> · PCM S16LE 16 kHz
+				<code>voxtral-mini-transcribe-realtime-2602</code>
+				{conversationMode && <> + <code>mistral-medium-latest</code></>}
 			</footer>
 		</div>
 	);

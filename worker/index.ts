@@ -6,16 +6,28 @@ export interface Env {
 	ASSETS: Fetcher;
 }
 
+interface ConversationMessage {
+	role: "user" | "assistant";
+	content: string;
+}
+
 /**
  * Durable Object that bridges a browser WebSocket to Mistral's realtime
- * transcription WebSocket API. One instance per transcription session.
+ * transcription WebSocket API, with optional conversation mode.
  *
- * Browser  ──ws──▸  TranscriptionRoom  ──ws──▸  Mistral API
+ * Browser  ──ws──▸  TranscriptionRoom  ──ws──▸  Mistral Transcription API
  *   (PCM binary)       (base64 JSON)
+ *                           │
+ *                           ▼
+ *                   Mistral Conversations API (when conversationMode=true)
  */
 export class TranscriptionRoom extends DurableObject<Env> {
 	private mistralWs: WebSocket | null = null;
 	private isReady = false;
+	private conversationMode = false;
+	private conversationHistory: ConversationMessage[] = [];
+	private currentTranscript = "";
+	private systemInstructions = "You are a helpful voice assistant. Keep responses concise and conversational.";
 
 	async fetch(request: Request): Promise<Response> {
 		if (request.headers.get("Upgrade") !== "websocket") {
@@ -39,9 +51,17 @@ export class TranscriptionRoom extends DurableObject<Env> {
 			try {
 				const data = JSON.parse(message);
 				if (data.type === "start") {
+					this.conversationMode = data.conversationMode ?? false;
+					this.currentTranscript = "";
+					if (data.systemInstructions) {
+						this.systemInstructions = data.systemInstructions;
+					}
 					await this.connectToMistral();
 				} else if (data.type === "stop") {
 					await this.stopTranscription();
+				} else if (data.type === "clear_history") {
+					this.conversationHistory = [];
+					this.sendToBrowser(JSON.stringify({ type: "history_cleared" }));
 				}
 			} catch (err) {
 				ws.send(
@@ -170,6 +190,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 					break;
 
 				case "transcription.text.delta":
+					this.currentTranscript += data.text;
 					this.sendToBrowser(
 						JSON.stringify({ type: "text_delta", text: data.text }),
 					);
@@ -187,6 +208,10 @@ export class TranscriptionRoom extends DurableObject<Env> {
 
 				case "transcription.done":
 					this.sendToBrowser(JSON.stringify({ type: "transcription_done" }));
+					// If conversation mode, send transcript to LLM
+					if (this.conversationMode && this.currentTranscript.trim()) {
+						this.handleConversation(this.currentTranscript.trim());
+					}
 					break;
 
 				case "error":
@@ -207,6 +232,88 @@ export class TranscriptionRoom extends DurableObject<Env> {
 			}
 		} catch (err) {
 			console.error("Failed to parse Mistral message:", err);
+		}
+	}
+
+	private async handleConversation(userMessage: string): Promise<void> {
+		// Add user message to history
+		this.conversationHistory.push({ role: "user", content: userMessage });
+
+		// Signal that we're generating a response
+		this.sendToBrowser(JSON.stringify({ type: "assistant_thinking" }));
+
+		try {
+			const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${this.env.MISTRAL_API_KEY}`,
+				},
+				body: JSON.stringify({
+					model: "mistral-medium-latest",
+					messages: [
+						{ role: "system", content: this.systemInstructions },
+						...this.conversationHistory,
+					],
+					temperature: 0.7,
+					max_tokens: 1024,
+					stream: true,
+				}),
+			});
+
+			if (!response.ok) {
+				const errorText = await response.text().catch(() => "Unknown error");
+				throw new Error(`Mistral API error (${response.status}): ${errorText}`);
+			}
+
+			// Stream the response
+			const reader = response.body?.getReader();
+			if (!reader) throw new Error("No response body");
+
+			const decoder = new TextDecoder();
+			let assistantMessage = "";
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				const chunk = decoder.decode(value, { stream: true });
+				const lines = chunk.split("\n");
+
+				for (const line of lines) {
+					if (line.startsWith("data: ")) {
+						const data = line.slice(6);
+						if (data === "[DONE]") continue;
+
+						try {
+							const parsed = JSON.parse(data);
+							const delta = parsed.choices?.[0]?.delta?.content;
+							if (delta) {
+								assistantMessage += delta;
+								this.sendToBrowser(
+									JSON.stringify({ type: "assistant_delta", text: delta }),
+								);
+							}
+						} catch {
+							// Ignore parse errors for incomplete chunks
+						}
+					}
+				}
+			}
+
+			// Add assistant message to history
+			if (assistantMessage) {
+				this.conversationHistory.push({ role: "assistant", content: assistantMessage });
+			}
+
+			this.sendToBrowser(JSON.stringify({ type: "assistant_done" }));
+		} catch (err) {
+			this.sendToBrowser(
+				JSON.stringify({
+					type: "error",
+					message: `Conversation error: ${err instanceof Error ? err.message : String(err)}`,
+				}),
+			);
 		}
 	}
 
@@ -268,7 +375,6 @@ export default {
 		}
 
 		// Let the static assets middleware handle everything else
-		// Return undefined/null to pass through to assets
 		return env.ASSETS.fetch(request);
 	},
 } satisfies ExportedHandler<Env>;
