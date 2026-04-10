@@ -22,6 +22,7 @@ function App() {
 	const workletRef = useRef<AudioWorkletNode | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement | null>(null);
+	const conversationModeRef = useRef(true);
 	
 	// Use refs to track current values for callbacks
 	const transcriptRef = useRef("");
@@ -35,6 +36,10 @@ function App() {
 	useEffect(() => {
 		assistantResponseRef.current = assistantResponse;
 	}, [assistantResponse]);
+
+	useEffect(() => {
+		conversationModeRef.current = conversationMode;
+	}, [conversationMode]);
 
 	// Auto-scroll to bottom when messages change
 	useEffect(() => {
@@ -148,7 +153,13 @@ function App() {
 								setMessages((prev) => [...prev, { role: "assistant", content: response }]);
 							}
 							setAssistantResponse("");
-							setStatus("idle");
+							// Auto-restart recording for continuous conversation
+							if (conversationModeRef.current && ws.readyState === WebSocket.OPEN) {
+								ws.send(JSON.stringify({ type: "start", conversationMode: true }));
+								// Will receive "ready" event which triggers startAudioCapture
+							} else {
+								setStatus("idle");
+							}
 							break;
 						case "history_cleared":
 							setMessages([]);
@@ -170,13 +181,7 @@ function App() {
 			};
 
 			ws.onclose = () => {
-				setStatus((current) => {
-					// Only go to idle if we're not in a transitional state
-					if (current === "recording" || current === "connecting") {
-						return "idle";
-					}
-					return current;
-				});
+				setStatus("idle");
 			};
 
 			await new Promise<void>((resolve, reject) => {
@@ -192,21 +197,19 @@ function App() {
 		}
 	}, [cleanup, cleanupAudio, startAudioCapture, conversationMode]);
 
-	const stopRecording = useCallback(() => {
-		// In conversation mode, send stop and wait for response
-		if (wsRef.current?.readyState === WebSocket.OPEN) {
+	const sendMessage = useCallback(() => {
+		// Send current transcript to get assistant response
+		if (wsRef.current?.readyState === WebSocket.OPEN && transcriptRef.current.trim()) {
 			wsRef.current.send(JSON.stringify({ type: "stop" }));
 		}
-		// Stop audio
 		cleanupAudio();
-		
-		// If not in conversation mode or no transcript, fully cleanup
-		if (!conversationMode || !transcriptRef.current.trim()) {
-			cleanup();
-			setStatus("idle");
-		}
-		// Otherwise, status will be set to "thinking" by assistant_thinking event
-	}, [cleanup, cleanupAudio, conversationMode]);
+	}, [cleanupAudio]);
+
+	const endConversation = useCallback(() => {
+		// Fully stop the conversation
+		cleanup();
+		setStatus("idle");
+	}, [cleanup]);
 
 	const clearHistory = useCallback(() => {
 		if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -216,6 +219,8 @@ function App() {
 		setTranscript("");
 		setAssistantResponse("");
 	}, []);
+
+	const isActive = status === "recording" || status === "thinking" || status === "connecting";
 
 	return (
 		<div className="app">
@@ -231,14 +236,14 @@ function App() {
 				<button
 					className={`mode-btn ${!conversationMode ? "active" : ""}`}
 					onClick={() => setConversationMode(false)}
-					disabled={status !== "idle"}
+					disabled={isActive}
 				>
 					Transcription
 				</button>
 				<button
 					className={`mode-btn ${conversationMode ? "active" : ""}`}
 					onClick={() => setConversationMode(true)}
-					disabled={status !== "idle"}
+					disabled={isActive}
 				>
 					Conversation
 				</button>
@@ -255,7 +260,9 @@ function App() {
 					<div className="chat-messages">
 						{messages.length === 0 && !transcript && !assistantResponse && status !== "thinking" && (
 							<div className="chat-placeholder">
-								Press the button and speak to start a conversation
+								{status === "recording" 
+									? "Listening — start speaking…" 
+									: "Press the button to start a conversation"}
 							</div>
 						)}
 
@@ -325,7 +332,7 @@ function App() {
 				{status === "idle" ? (
 					<button className="btn-primary" onClick={startRecording}>
 						<MicIcon />
-						{conversationMode ? "Press to Speak" : "Start Recording"}
+						{conversationMode ? "Start Conversation" : "Start Recording"}
 					</button>
 				) : status === "connecting" ? (
 					<button className="btn-disabled" disabled>
@@ -337,13 +344,29 @@ function App() {
 						<span className="spinner" />
 						Thinking…
 					</button>
+				) : conversationMode ? (
+					<div className="btn-group">
+						<button className="btn-send" onClick={sendMessage} disabled={!transcript.trim()}>
+							Send
+						</button>
+						<button className="btn-stop" onClick={endConversation}>
+							End
+						</button>
+					</div>
 				) : (
-					<button className="btn-stop" onClick={stopRecording}>
+					<button className="btn-stop" onClick={endConversation}>
 						<span className="stop-icon">■</span>
-						{conversationMode ? "Send" : "Stop"}
+						Stop
 					</button>
 				)}
 			</div>
+
+			{/* Status indicator for conversation mode */}
+			{conversationMode && status === "recording" && (
+				<div className="status-indicator">
+					<span className="pulse" /> Listening…
+				</div>
+			)}
 
 			{/* Secondary actions */}
 			<div className="secondary-actions">

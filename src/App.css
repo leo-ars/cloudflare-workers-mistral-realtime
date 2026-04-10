@@ -289,6 +289,59 @@
 	font-size: 0.75em;
 }
 
+/* ---- Button Group ---- */
+.btn-group {
+	display: flex;
+	gap: 12px;
+}
+
+.btn-send {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+	padding: 14px 32px;
+	border-radius: 9999px;
+	font-size: 1rem;
+	font-weight: 500;
+	font-family: inherit;
+	cursor: pointer;
+	transition: all 0.15s ease;
+	border: none;
+	background: var(--cf-orange);
+	color: #fff;
+}
+.btn-send:hover:not(:disabled) {
+	background: var(--cf-orange-hover);
+}
+.btn-send:disabled {
+	background: var(--cf-bg-hover);
+	color: var(--cf-text-muted);
+	border: 1px solid var(--cf-border);
+	cursor: not-allowed;
+}
+
+/* ---- Status Indicator ---- */
+.status-indicator {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--cf-text-muted);
+	font-size: 0.9rem;
+}
+
+.pulse {
+	width: 10px;
+	height: 10px;
+	background: var(--cf-orange);
+	border-radius: 50%;
+	animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+	0%, 100% { opacity: 1; transform: scale(1); }
+	50% { opacity: 0.5; transform: scale(0.8); }
+}
+
 /* ---- Secondary Actions ---- */
 .secondary-actions {
 	display: flex;
