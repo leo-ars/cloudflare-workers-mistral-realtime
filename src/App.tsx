@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import "./App.css";
 
-type Status = "idle" | "connecting" | "recording" | "stopping" | "thinking";
+type Status = "idle" | "connecting" | "recording" | "thinking";
 
 interface Message {
 	role: "user" | "assistant";
@@ -39,7 +39,7 @@ function App() {
 	// Auto-scroll to bottom when messages change
 	useEffect(() => {
 		messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-	}, [messages, assistantResponse]);
+	}, [messages, assistantResponse, transcript]);
 
 	const cleanupAudio = useCallback(() => {
 		if (workletRef.current) {
@@ -68,12 +68,18 @@ function App() {
 	useEffect(() => cleanup, [cleanup]);
 
 	const startAudioCapture = useCallback(async (ws: WebSocket) => {
+		// Get fresh microphone stream
+		const stream = await navigator.mediaDevices.getUserMedia({
+			audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+		});
+		streamRef.current = stream;
+
 		const audioCtx = new AudioContext();
 		audioCtxRef.current = audioCtx;
 
 		await audioCtx.audioWorklet.addModule("/audio-processor.js");
 
-		const source = audioCtx.createMediaStreamSource(streamRef.current!);
+		const source = audioCtx.createMediaStreamSource(stream);
 		const worklet = new AudioWorkletNode(audioCtx, "pcm-processor");
 		workletRef.current = worklet;
 
@@ -94,11 +100,6 @@ function App() {
 			setTranscript("");
 			setAssistantResponse("");
 			setLanguage(null);
-
-			const stream = await navigator.mediaDevices.getUserMedia({
-				audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-			});
-			streamRef.current = stream;
 
 			const proto = location.protocol === "https:" ? "wss:" : "ws:";
 			const ws = new WebSocket(`${proto}//${location.host}/api/transcribe`);
@@ -130,7 +131,10 @@ function App() {
 							// Stop audio capture while assistant is thinking
 							cleanupAudio();
 							// Add user message using ref for current value
-							setMessages((prev) => [...prev, { role: "user", content: transcriptRef.current }]);
+							const userMsg = transcriptRef.current;
+							if (userMsg.trim()) {
+								setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
+							}
 							setTranscript("");
 							setAssistantResponse("");
 							break;
@@ -139,20 +143,12 @@ function App() {
 							break;
 						case "assistant_done":
 							// Move streaming response to messages using ref
-							setMessages((prev) => {
-								const response = assistantResponseRef.current;
-								if (response) {
-									return [...prev, { role: "assistant", content: response }];
-								}
-								return prev;
-							});
+							const response = assistantResponseRef.current;
+							if (response) {
+								setMessages((prev) => [...prev, { role: "assistant", content: response }]);
+							}
 							setAssistantResponse("");
 							setStatus("idle");
-							// Close WebSocket - user needs to click button for next turn
-							if (wsRef.current) {
-								wsRef.current.close();
-								wsRef.current = null;
-							}
 							break;
 						case "history_cleared":
 							setMessages([]);
@@ -174,8 +170,13 @@ function App() {
 			};
 
 			ws.onclose = () => {
-				// Don't reset status if we're thinking
-				setStatus((current) => current === "thinking" ? current : "idle");
+				setStatus((current) => {
+					// Only go to idle if we're not in a transitional state
+					if (current === "recording" || current === "connecting") {
+						return "idle";
+					}
+					return current;
+				});
 			};
 
 			await new Promise<void>((resolve, reject) => {
@@ -196,10 +197,10 @@ function App() {
 		if (wsRef.current?.readyState === WebSocket.OPEN) {
 			wsRef.current.send(JSON.stringify({ type: "stop" }));
 		}
-		// Stop audio but keep WS open for response
+		// Stop audio
 		cleanupAudio();
 		
-		// If not in conversation mode or no transcript, go to idle
+		// If not in conversation mode or no transcript, fully cleanup
 		if (!conversationMode || !transcriptRef.current.trim()) {
 			cleanup();
 			setStatus("idle");
@@ -331,10 +332,10 @@ function App() {
 						<span className="spinner" />
 						Connecting…
 					</button>
-				) : status === "thinking" || status === "stopping" ? (
+				) : status === "thinking" ? (
 					<button className="btn-disabled" disabled>
 						<span className="spinner" />
-						{status === "thinking" ? "Thinking…" : "Processing…"}
+						Thinking…
 					</button>
 				) : (
 					<button className="btn-stop" onClick={stopRecording}>

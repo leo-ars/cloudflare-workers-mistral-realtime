@@ -21,7 +21,7 @@ export class TranscriptionRoom extends DurableObject<Env> {
 	private conversationMode = false;
 	private conversationHistory: ConversationMessage[] = [];
 	private currentTranscript = "";
-	private systemInstructions = "You are a helpful voice assistant. Keep responses concise and conversational.";
+	private systemInstructions = "You are a helpful voice assistant. Keep responses concise and conversational. Respond in the same language as the user.";
 	private lastTextTime = 0;
 	private silenceCheckInterval: ReturnType<typeof setInterval> | null = null;
 	private isProcessingResponse = false;
@@ -145,8 +145,6 @@ export class TranscriptionRoom extends DurableObject<Env> {
 		
 		// Trigger LLM response
 		await this.handleConversation(transcript);
-		
-		// Don't auto-reconnect - let user click button again
 	}
 
 	private async connectToMistral(): Promise<void> {
@@ -325,31 +323,56 @@ export class TranscriptionRoom extends DurableObject<Env> {
 
 			const decoder = new TextDecoder();
 			let assistantMessage = "";
+			let buffer = "";
 
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 
-				const chunk = decoder.decode(value, { stream: true });
-				const lines = chunk.split("\n");
+				buffer += decoder.decode(value, { stream: true });
+				
+				// Process complete lines from buffer
+				const lines = buffer.split("\n");
+				// Keep the last potentially incomplete line in buffer
+				buffer = lines.pop() || "";
 
 				for (const line of lines) {
-					if (line.startsWith("data: ")) {
-						const data = line.slice(6);
-						if (data === "[DONE]") continue;
+					const trimmed = line.trim();
+					if (!trimmed || !trimmed.startsWith("data: ")) continue;
+					
+					const data = trimmed.slice(6);
+					if (data === "[DONE]") continue;
 
-						try {
-							const parsed = JSON.parse(data);
-							const delta = parsed.choices?.[0]?.delta?.content;
-							if (delta) {
-								assistantMessage += delta;
-								this.sendToBrowser(
-									JSON.stringify({ type: "assistant_delta", text: delta }),
-								);
-							}
-						} catch {
-							// Ignore parse errors for incomplete chunks
+					try {
+						const parsed = JSON.parse(data);
+						const delta = parsed.choices?.[0]?.delta?.content;
+						if (delta) {
+							assistantMessage += delta;
+							this.sendToBrowser(
+								JSON.stringify({ type: "assistant_delta", text: delta }),
+							);
 						}
+					} catch {
+						// Ignore parse errors for incomplete JSON
+					}
+				}
+			}
+			
+			// Process any remaining data in buffer
+			if (buffer.trim()) {
+				const trimmed = buffer.trim();
+				if (trimmed.startsWith("data: ") && trimmed.slice(6) !== "[DONE]") {
+					try {
+						const parsed = JSON.parse(trimmed.slice(6));
+						const delta = parsed.choices?.[0]?.delta?.content;
+						if (delta) {
+							assistantMessage += delta;
+							this.sendToBrowser(
+								JSON.stringify({ type: "assistant_delta", text: delta }),
+							);
+						}
+					} catch {
+						// Ignore
 					}
 				}
 			}
