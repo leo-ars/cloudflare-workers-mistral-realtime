@@ -7,7 +7,6 @@ declare namespace Cloudflare {
 		durableNamespaces: "TranscriptionRoom";
 	}
 	interface Env {
-		ELEVENLABS_API_KEY: SecretsStoreSecret;
 		ASSETS: Fetcher;
 		TRANSCRIPTION_ROOM: DurableObjectNamespace<import("./worker/index").TranscriptionRoom>;
 	}
